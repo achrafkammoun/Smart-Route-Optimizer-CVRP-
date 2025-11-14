@@ -1,0 +1,827 @@
+# improved_cvrp_tw.py
+import random
+import math
+import copy
+from typing import List, Dict, Tuple, Optional
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Optional numba; safe fallback if not installed
+try:
+    from numba import jit
+    NUMBA_AVAILABLE = True
+except Exception:
+    NUMBA_AVAILABLE = False
+
+# -----------------------
+# Utilities & validation
+# -----------------------
+def set_seed(seed: Optional[int]):
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+def generate_adjacency_matrix(node_coords: List[Tuple[float, float]]) -> np.ndarray:
+    """Euclidean distance matrix."""
+    n = len(node_coords)
+    matrix = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        xi, yi = node_coords[i]
+        for j in range(i + 1, n):
+            xj, yj = node_coords[j]
+            d = math.hypot(xi - xj, yi - yj)
+            matrix[i, j] = d
+            matrix[j, i] = d
+    return matrix
+
+# -----------------------
+# Cost calculation
+# -----------------------
+# We'll implement two versions: numba-accelerated if available, otherwise pure numpy/python.
+def _calculate_cost_py(routes_flat: np.ndarray,
+                       route_lengths: np.ndarray,
+                       matrix: np.ndarray,
+                       earliest: np.ndarray,
+                       latest: np.ndarray,
+                       has_tw: bool,
+                       penalty_weight: float = 2.0) -> float:
+    total_distance = 0.0
+    total_penalty = 0.0
+    idx = 0
+    for length in route_lengths:
+        if length < 2:
+            idx += length
+            continue
+        current_time = 0.0
+        for i in range(length - 1):
+            a = int(routes_flat[idx + i])
+            b = int(routes_flat[idx + i + 1])
+            travel = matrix[a, b]
+            total_distance += travel
+            if has_tw:
+                arrival = current_time + travel
+                if arrival > latest[b]:
+                    total_penalty += (arrival - latest[b]) * penalty_weight
+                current_time = max(arrival, earliest[b])
+                # service time for customers (non-depot)
+                if b != 0:
+                    current_time += 10.0
+            else:
+                # simple time accumulation for sequence (used if want to compute arrival times)
+                current_time += travel
+        idx += length
+    return total_distance + total_penalty
+
+# numba version if available
+if NUMBA_AVAILABLE:
+    @jit(nopython=True)
+    def _calculate_cost_numba(routes_flat, route_lengths, matrix, earliest, latest, has_tw, penalty_weight=2.0):
+        total_distance = 0.0
+        total_penalty = 0.0
+        idx = 0
+        for r in range(route_lengths.shape[0]):
+            length = route_lengths[r]
+            if length < 2:
+                idx += length
+                continue
+            current_time = 0.0
+            for i in range(length - 1):
+                a = routes_flat[idx + i]
+                b = routes_flat[idx + i + 1]
+                travel = matrix[a][b]
+                total_distance += travel
+                if has_tw:
+                    arrival = current_time + travel
+                    if arrival > latest[b]:
+                        total_penalty += (arrival - latest[b]) * penalty_weight
+                    # wait if early
+                    if arrival < earliest[b]:
+                        current_time = earliest[b]
+                    else:
+                        current_time = arrival
+                    if b != 0:
+                        current_time += 10.0
+                else:
+                    current_time += travel
+            idx += length
+        return total_distance + total_penalty
+
+def calculate_cost(routes_flat: np.ndarray,
+                   route_lengths: np.ndarray,
+                   matrix: np.ndarray,
+                   earliest: np.ndarray,
+                   latest: np.ndarray,
+                   use_numba: bool = True,
+                   penalty_weight: float = 2.0) -> float:
+    has_tw = (earliest is not None and latest is not None)
+    if use_numba and NUMBA_AVAILABLE:
+        return float(_calculate_cost_numba(routes_flat, route_lengths, matrix, earliest, latest, has_tw, penalty_weight))
+    else:
+        return float(_calculate_cost_py(routes_flat, route_lengths, matrix, earliest, latest, has_tw, penalty_weight))
+
+def route_cost(routes: List[List[int]],
+               matrix: np.ndarray,
+               earliest: Optional[np.ndarray] = None,
+               latest: Optional[np.ndarray] = None,
+               use_numba: bool = True) -> float:
+    """Wrapper that flattens routes and calls the cost function."""
+    routes_flat = np.array([int(n) for r in routes for n in r], dtype=np.int32)
+    route_lengths = np.array([len(r) for r in routes], dtype=np.int32)
+    n = matrix.shape[0]
+    if earliest is None or latest is None:
+        earliest_arr = np.zeros(n, dtype=np.float64)
+        latest_arr = np.ones(n, dtype=np.float64) * 1e12
+    else:
+        earliest_arr = np.array(earliest, dtype=np.float64)
+        latest_arr = np.array(latest, dtype=np.float64)
+    return calculate_cost(routes_flat, route_lengths, matrix, earliest_arr, latest_arr, use_numba, penalty_weight=2.0)
+
+# -----------------------
+# Solution encoding helpers
+# -----------------------
+def create_giant_tour(customers: List[int], seed: Optional[int] = None) -> List[int]:
+    tour = customers[:]
+    if seed is not None:
+        rnd = random.Random(seed)
+        rnd.shuffle(tour)
+    else:
+        random.shuffle(tour)
+    return tour
+
+def enforce_depot_ends(routes: List[List[int]]) -> List[List[int]]:
+    """Ensure every route starts and ends with depot 0. If route is empty, make [0,0]."""
+    new = []
+    for r in routes:
+        if len(r) == 0:
+            new.append([0, 0])
+        else:
+            if r[0] != 0:
+                r = [0] + r
+            if r[-1] != 0:
+                r = r + [0]
+            new.append(r)
+    return new
+
+def split_into_routes(tour: List[int],
+                      demands: List[int],
+                      capacity: int,
+                      num_vehicles: int,
+                      matrix: Optional[np.ndarray] = None,
+                      earliest: Optional[np.ndarray] = None,
+                      latest: Optional[np.ndarray] = None,
+                      allow_soft_tw: bool = True) -> List[List[int]]:
+    """
+    Build routes from a giant tour ensuring capacity and (soft) time-window feasibility.
+    Returns exactly num_vehicles routes (pads with [0,0] if needed).
+    """
+    routes: List[List[int]] = []
+    current_route = [0]
+    load = 0
+    current_time = 0.0
+    last_node = 0
+
+    has_tw = (matrix is not None and earliest is not None and latest is not None)
+
+    for customer in tour:
+        demand = demands[customer]
+        travel_time = matrix[last_node, customer] if matrix is not None else 0.0
+        arrival_time = current_time + travel_time if matrix is not None else 0.0
+
+        need_new = False
+        # Capacity constraint
+        if load + demand > capacity:
+            need_new = True
+
+        # Time window feasibility: prefer to start a new route if arrival far beyond latest
+        if has_tw and not need_new:
+            # if arrival_time exceeds latest by a significant margin, consider new route
+            if arrival_time > latest[customer] + (50.0 if allow_soft_tw else 0.0):
+                # check whether starting from depot would be feasible
+                depot_arrival = matrix[0, customer]
+                if depot_arrival <= latest[customer]:
+                    need_new = True
+
+        # if we already have assigned as many routes as vehicles-1, avoid creating more (except last)
+        if need_new and len(routes) >= num_vehicles - 1:
+            need_new = False
+
+        if need_new:
+            # close and start new
+            if len(current_route) > 1:
+                current_route.append(0)
+                routes.append(current_route)
+            # start fresh route from depot
+            current_route = [0, customer]
+            load = demand
+            last_node = customer
+            if has_tw:
+                travel_time = matrix[0, customer]
+                arrival = travel_time
+                current_time = max(arrival, earliest[customer]) + 10.0
+            else:
+                current_time = 0.0
+        else:
+            # append to current route
+            current_route.append(customer)
+            load += demand
+            if has_tw:
+                travel_time = matrix[last_node, customer]
+                arrival = current_time + travel_time
+                current_time = max(arrival, earliest[customer]) + 10.0
+            last_node = customer
+
+    # close final route
+    if len(current_route) > 1:
+        current_route.append(0)
+        routes.append(current_route)
+
+    # If we have fewer routes than vehicles, pad
+    while len(routes) < num_vehicles:
+        routes.append([0, 0])
+
+    # If more routes than vehicles, merge smallest non-empty greedily
+    while len([r for r in routes if len(r) > 2]) > num_vehicles:
+        non_empty = [r for r in routes if len(r) > 2]
+        non_empty.sort(key=lambda r: len(r))
+        if len(non_empty) >= 2:
+            r1 = non_empty[0]
+            r2 = non_empty[1]
+            merged = r1[:-1] + r2[1:]
+            routes.remove(r1)
+            routes.remove(r2)
+            routes.append(merged)
+        else:
+            # only one non-empty route -> break
+            break
+
+    # final guarantee: ensure depot at ends
+    routes = enforce_depot_ends(routes)
+    # ensure exact number
+    if len(routes) > num_vehicles:
+        # drop smallest empty ones
+        routes.sort(key=lambda r: (len(r) <= 2, len(r)))
+        routes = routes[:num_vehicles]
+
+    return routes
+
+# -----------------------
+# Initialization heuristics
+# -----------------------
+def nearest_neighbor_tour(customers: List[int], matrix: np.ndarray, start_depot: int = 0) -> List[int]:
+    if matrix is None or matrix.shape[0] <= max(customers):
+        tour = customers[:]
+        random.shuffle(tour)
+        return tour
+    remaining = set(customers)
+    tour = []
+    current = start_depot
+    while remaining:
+        nearest = min(remaining, key=lambda c: matrix[current, c])
+        tour.append(nearest)
+        remaining.remove(nearest)
+        current = nearest
+    return tour
+
+def initialize_population(pop_size: int,
+                          customers: List[int],
+                          demands: List[int],
+                          capacity: int,
+                          num_vehicles: int,
+                          matrix: Optional[np.ndarray] = None,
+                          earliest: Optional[np.ndarray] = None,
+                          latest: Optional[np.ndarray] = None,
+                          seed: Optional[int] = None) -> List[List[List[int]]]:
+    pop: List[List[List[int]]] = []
+    half = pop_size // 2
+    # 1. Random
+    for _ in range(half):
+        tour = create_giant_tour(customers, seed=None)
+        pop.append(split_into_routes(tour, demands, capacity, num_vehicles, matrix, earliest, latest))
+    # 2. TW-sorted or randomized slight perturb
+    quarter = pop_size // 4
+    if earliest is not None:
+        for _ in range(quarter):
+            tour = sorted(customers, key=lambda c: earliest[c] + random.uniform(-10.0, 10.0))
+            pop.append(split_into_routes(tour, demands, capacity, num_vehicles, matrix, earliest, latest))
+    else:
+        for _ in range(quarter):
+            tour = create_giant_tour(customers)
+            pop.append(split_into_routes(tour, demands, capacity, num_vehicles, matrix, earliest, latest))
+    # 3. NN-based fill
+    while len(pop) < pop_size:
+        tour = nearest_neighbor_tour(customers, matrix) if matrix is not None else create_giant_tour(customers)
+        pop.append(split_into_routes(tour, demands, capacity, num_vehicles, matrix, earliest, latest))
+    return pop
+
+# -----------------------
+# Genetic operators
+# -----------------------
+def order_crossover(parent1: List[List[int]],
+                    parent2: List[List[int]],
+                    demands: List[int],
+                    capacity: int,
+                    num_vehicles: int,
+                    matrix: Optional[np.ndarray] = None,
+                    earliest: Optional[np.ndarray] = None,
+                    latest: Optional[np.ndarray] = None) -> List[List[int]]:
+    # extract giant tours (customers only)
+    p1 = [c for r in parent1 for c in r if c != 0]
+    p2 = [c for r in parent2 for c in r if c != 0]
+    if not p1:
+        p1 = p2[:]
+    if not p2:
+        p2 = p1[:]
+    size = len(p1)
+    if size == 0:
+        return split_into_routes([], demands, capacity, num_vehicles, matrix, earliest, latest)
+    a, b = sorted(random.sample(range(size), 2))
+    child = [None] * size
+    # copy slice [a, b] inclusive
+    for i in range(a, b + 1):
+        child[i] = p1[i]
+    fill_pos = (b + 1) % size
+    for gene in p2[b+1:] + p2[:b+1]:
+        if gene not in child:
+            child[fill_pos] = gene
+            fill_pos = (fill_pos + 1) % size
+    return split_into_routes(child, demands, capacity, num_vehicles, matrix, earliest, latest)
+
+def mutate(routes: List[List[int]],
+           demands: List[int],
+           capacity: int,
+           num_vehicles: int,
+           mutation_rate: float = 0.2,
+           matrix: Optional[np.ndarray] = None,
+           earliest: Optional[np.ndarray] = None,
+           latest: Optional[np.ndarray] = None) -> List[List[int]]:
+    tour = [c for r in routes for c in r if c != 0]
+    n = len(tour)
+    if n < 2:
+        return routes
+    # multiple mutation types with probabilities
+    if random.random() < mutation_rate:
+        i, j = sorted(random.sample(range(n), 2))
+        # swap or reversal or relocate
+        op = random.choice(['swap', 'reverse', 'relocate'])
+        if op == 'swap':
+            tour[i], tour[j] = tour[j], tour[i]
+        elif op == 'reverse' and j - i >= 1:
+            tour[i:j+1] = list(reversed(tour[i:j+1]))
+        elif op == 'relocate':
+            x = tour.pop(j)
+            tour.insert(i, x)
+    return split_into_routes(tour, demands, capacity, num_vehicles, matrix, earliest, latest)
+
+# -----------------------
+# Local search operators
+# -----------------------
+def calculate_route_violations(route: List[int],
+                               matrix: np.ndarray,
+                               earliest: np.ndarray,
+                               latest: np.ndarray) -> float:
+    if len(route) <= 2:
+        return 0.0
+    cur = 0.0
+    viol = 0.0
+    for i in range(len(route) - 1):
+        a, b = route[i], route[i+1]
+        travel = matrix[a, b]
+        arrival = cur + travel
+        if arrival > latest[b]:
+            viol += (arrival - latest[b])
+        cur = max(arrival, earliest[b])
+        if b != 0:
+            cur += 10.0
+    return viol
+
+def two_opt_single_route(route: List[int], matrix: np.ndarray) -> List[int]:
+    if len(route) <= 3:
+        return route
+    best = route[:]
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, len(best) - 2):
+            for j in range(i + 1, len(best) - 1):
+                a, b = best[i-1], best[i]
+                c, d = best[j], best[j+1]
+                old = matrix[a, b] + matrix[c, d]
+                new = matrix[a, c] + matrix[b, d]
+                if new + 1e-6 < old:
+                    best[i:j+1] = list(reversed(best[i:j+1]))
+                    improved = True
+                    break
+            if improved:
+                break
+    return best
+
+def two_opt(routes: List[List[int]], matrix: np.ndarray) -> List[List[int]]:
+    return [two_opt_single_route(r[:], matrix) for r in routes]
+
+def relocate_inter_route(routes: List[List[int]],
+                         demands: List[int],
+                         capacity: int,
+                         matrix: np.ndarray,
+                         max_iterations: int = 50) -> List[List[int]]:
+    best_routes = [r[:] for r in routes]
+    iteration = 0
+    improved = True
+    while improved and iteration < max_iterations:
+        improved = False
+        iteration += 1
+        for i in range(len(best_routes)):
+            if len(best_routes[i]) <= 2:
+                continue
+            for ci in range(1, len(best_routes[i]) - 1):
+                customer = best_routes[i][ci]
+                for j in range(len(best_routes)):
+                    if i == j:
+                        continue
+                    load_j = sum(demands[c] for c in best_routes[j][1:-1])
+                    if load_j + demands[customer] > capacity:
+                        continue
+                    best_delta = 0
+                    best_pos = None
+                    cost_before_removal = (matrix[best_routes[i][ci-1], customer] +
+                                           matrix[customer, best_routes[i][ci+1]])
+                    for insert_pos in range(1, len(best_routes[j])):
+                        cost_removal = matrix[best_routes[i][ci-1], best_routes[i][ci+1]]
+                        cost_insertion = (matrix[best_routes[j][insert_pos-1], customer] +
+                                          matrix[customer, best_routes[j][insert_pos]])
+                        cost_old_edge = matrix[best_routes[j][insert_pos-1], best_routes[j][insert_pos]]
+                        delta = (cost_removal + cost_insertion) - (cost_before_removal + cost_old_edge)
+                        if delta < best_delta:
+                            best_delta = delta
+                            best_pos = insert_pos
+                    if best_pos is not None:
+                        best_routes[i].pop(ci)
+                        best_routes[j].insert(best_pos, customer)
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+    return best_routes
+
+def or_opt(routes: List[List[int]], matrix: np.ndarray, max_iterations: int = 30) -> List[List[int]]:
+    best_routes = [r[:] for r in routes]
+    iteration = 0
+    improved = True
+    while improved and iteration < max_iterations:
+        improved = False
+        iteration += 1
+        for idx, route in enumerate(best_routes):
+            if len(route) <= 3:
+                continue
+            for seq_len in (1, 2, 3):
+                if len(route) - 2 < seq_len:
+                    continue
+                for i in range(1, len(route) - seq_len):
+                    seq = route[i:i+seq_len]
+                    new_route = route[:i] + route[i+seq_len:]
+                    for j in range(1, len(new_route)):
+                        # compute delta approximately (edge differences)
+                        before_remove = matrix[route[i-1], route[i+seq_len]]
+                        before_edges = matrix[route[i-1], route[i]] + matrix[route[i+seq_len-1], route[i+seq_len]]
+                        before_insert = matrix[new_route[j-1], new_route[j]]
+                        insert_cost = matrix[new_route[j-1], seq[0]] + matrix[seq[-1], new_route[j]]
+                        delta = (before_remove + insert_cost) - (before_edges + before_insert)
+                        if delta < -1e-2:
+                            best_routes[idx] = new_route[:j] + seq + new_route[j:]
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+    return best_routes
+
+def swap_inter_route(routes: List[List[int]],
+                     demands: List[int],
+                     capacity: int,
+                     matrix: np.ndarray,
+                     max_iterations: int = 50) -> List[List[int]]:
+    best_routes = [r[:] for r in routes]
+    iteration = 0
+    improved = True
+    while improved and iteration < max_iterations:
+        improved = False
+        iteration += 1
+        for i in range(len(best_routes)):
+            if len(best_routes[i]) <= 2:
+                continue
+            load_i = sum(demands[c] for c in best_routes[i][1:-1])
+            for ci in range(1, len(best_routes[i]) - 1):
+                cust_i = best_routes[i][ci]
+                for j in range(i+1, len(best_routes)):
+                    if len(best_routes[j]) <= 2:
+                        continue
+                    load_j = sum(demands[c] for c in best_routes[j][1:-1])
+                    for cj in range(1, len(best_routes[j]) - 1):
+                        cust_j = best_routes[j][cj]
+                        new_load_i = load_i - demands[cust_i] + demands[cust_j]
+                        new_load_j = load_j - demands[cust_j] + demands[cust_i]
+                        if new_load_i > capacity or new_load_j > capacity:
+                            continue
+                        cost_i_before = matrix[best_routes[i][ci-1], cust_i] + matrix[cust_i, best_routes[i][ci+1]]
+                        cost_i_after = matrix[best_routes[i][ci-1], cust_j] + matrix[cust_j, best_routes[i][ci+1]]
+                        cost_j_before = matrix[best_routes[j][cj-1], cust_j] + matrix[cust_j, best_routes[j][cj+1]]
+                        cost_j_after = matrix[best_routes[j][cj-1], cust_i] + matrix[cust_i, best_routes[j][cj+1]]
+                        delta = (cost_i_after + cost_j_after) - (cost_i_before + cost_j_before)
+                        if delta < -1e-2:
+                            best_routes[i][ci], best_routes[j][cj] = cust_j, cust_i
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+    return best_routes
+
+# -----------------------
+# Selection
+# -----------------------
+def tournament_selection(population: List[List[List[int]]], costs: List[float], k: int = 5) -> List[List[int]]:
+    competitors = random.sample(list(range(len(population))), min(k, len(population)))
+    best_idx = min(competitors, key=lambda idx: costs[idx])
+    return copy.deepcopy(population[best_idx])
+
+# -----------------------
+# Visualization
+# -----------------------
+def plot_solution(routes: List[List[int]], coords: Dict[int, Tuple[float, float]], title: str = "VRP Solution"):
+    plt.figure(figsize=(10, 7))
+    colors = plt.cm.tab20(np.linspace(0, 1, max(1, len(routes))))
+    for idx, route in enumerate(routes):
+        if len(route) > 2:
+            x = [coords[i][0] for i in route]
+            y = [coords[i][1] for i in route]
+            plt.plot(x, y, 'o-', linewidth=2, markersize=6, color=colors[idx], label=f"Route {idx+1}")
+    depot_x, depot_y = coords[0]
+    plt.scatter(depot_x, depot_y, marker='s', s=200, label='Depot', zorder=5)
+    plt.title(title)
+    plt.xlabel("X")
+    plt.ylabel("Y")
+    plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    plt.grid(True)
+    plt.axis('equal')
+    plt.tight_layout()
+    plt.show()
+
+def plot_convergence(history: Dict[str, List[float]]):
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['best'], label='Best', linewidth=2)
+    plt.plot(history['avg'], label='Avg', linewidth=1.5)
+    plt.plot(history['worst'], label='Worst', linewidth=1)
+    plt.yscale('log')
+    plt.xlabel("Generation")
+    plt.ylabel("Cost")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# -----------------------
+# Main GA
+# -----------------------
+def genetic_algorithm(instance: Dict,
+                      pop_size: int = 400,
+                      generations: int = 500,
+                      mutation_rate: float = 0.25,
+                      elitism: int = 10,
+                      tournament_size: int = 4,
+                      local_search_freq: int = 25,
+                      earliest: Optional[List[float]] = None,
+                      latest: Optional[List[float]] = None,
+                      seed: Optional[int] = None,
+                      use_numba: bool = True):
+    """
+    Core entry: instance should contain:
+      - node_coord: dict or list of coordinates (index 0 is depot)
+      - demand: dict or list (index aligned)
+      - capacity: vehicle capacity
+      - vehicles: number of vehicles (optional)
+    """
+    set_seed(seed)
+
+    coords_raw = instance["node_coord"]
+    node_coords = list(coords_raw.values()) if isinstance(coords_raw, dict) else coords_raw
+    demands_raw = instance["demand"]
+    demands = list(demands_raw.values()) if isinstance(demands_raw, dict) else demands_raw
+    capacity = instance["capacity"]
+    customers = list(range(1, len(node_coords)))
+    total_demand = sum(demands[c] for c in customers)
+
+    num_vehicles = instance.get("vehicles", 10)
+    # if user didn't set vehicles, we keep default but can also estimate:
+    if num_vehicles is None:
+        num_vehicles = max(1, math.ceil(total_demand / capacity))
+
+    matrix = generate_adjacency_matrix(node_coords)
+
+    if earliest is not None and latest is not None:
+        earliest = np.array(earliest, dtype=np.float64)
+        latest = np.array(latest, dtype=np.float64)
+    else:
+        earliest = None
+        latest = None
+
+    population = initialize_population(pop_size, customers, demands, capacity, num_vehicles, matrix, earliest, latest, seed=seed)
+
+    best_solution = None
+    best_cost = float('inf')
+    stagnation_counter = 0
+    history = {'best': [], 'avg': [], 'worst': []}
+
+    for gen in range(generations):
+        costs = [route_cost(ind, matrix, earliest, latest, use_numba=use_numba) for ind in population]
+
+        gen_best_idx = int(np.argmin(costs))
+        gen_best_cost = costs[gen_best_idx]
+
+        if gen_best_cost < best_cost - 1e-6:
+            best_cost = gen_best_cost
+            best_solution = copy.deepcopy(population[gen_best_idx])
+            stagnation_counter = 0
+        else:
+            stagnation_counter += 1
+
+        # diversity restart
+        if stagnation_counter > 300:
+            keep_best = min(20, pop_size // 10)
+            elite_indices = list(np.argsort(costs)[:keep_best])
+            new_pop = [copy.deepcopy(population[i]) for i in elite_indices]
+            while len(new_pop) < pop_size:
+                tour = create_giant_tour(customers)
+                if earliest is not None and random.random() < 0.3:
+                    tour.sort(key=lambda c: earliest[c])
+                new_pop.append(split_into_routes(tour, demands, capacity, num_vehicles, matrix, earliest, latest))
+            population = new_pop
+            stagnation_counter = 0
+            continue
+
+        # statistics
+        history['best'].append(best_cost)
+        history['avg'].append(float(np.mean(costs)))
+        history['worst'].append(float(np.max(costs)))
+
+        if gen % 100 == 0:
+            print(f"Gen {gen:4d} | Best {best_cost:.2f} | Avg {history['avg'][-1]:.2f} | Worst {history['worst'][-1]:.2f}")
+
+        # local search occasionally on current best
+        if gen % local_search_freq == 0 and gen > 0:
+            start_cost = best_cost
+            sol = copy.deepcopy(best_solution)
+            if earliest is not None:
+                sol = repair_time_windows(sol, matrix, earliest, latest) if 'repair_time_windows' in globals() else sol
+                c = route_cost(sol, matrix, earliest, latest, use_numba=use_numba)
+                if c < best_cost:
+                    best_solution, best_cost = sol, c
+
+            sol = two_opt(best_solution, matrix)
+            c = route_cost(sol, matrix, earliest, latest, use_numba=use_numba)
+            if c < best_cost:
+                best_solution, best_cost = sol, c
+
+            sol = or_opt(best_solution, matrix, max_iterations=30)
+            c = route_cost(sol, matrix, earliest, latest, use_numba=use_numba)
+            if c < best_cost:
+                best_solution, best_cost = sol, c
+
+            sol = relocate_inter_route(best_solution, demands, capacity, matrix, max_iterations=30)
+            c = route_cost(sol, matrix, earliest, latest, use_numba=use_numba)
+            if c < best_cost:
+                best_solution, best_cost = sol, c
+
+            sol = swap_inter_route(best_solution, demands, capacity, matrix, max_iterations=20)
+            c = route_cost(sol, matrix, earliest, latest, use_numba=use_numba)
+            if c < best_cost:
+                best_solution, best_cost = sol, c
+
+            if best_cost < start_cost:
+                print(f"  -> Local search improved to {best_cost:.2f}")
+
+        # generational replacement with elitism
+        new_pop: List[List[List[int]]] = []
+        elite_indices = list(np.argsort(costs)[:elitism])
+        for i in elite_indices:
+            new_pop.append(copy.deepcopy(population[i]))
+
+        while len(new_pop) < pop_size:
+            p1 = tournament_selection(population, costs, tournament_size)
+            p2 = tournament_selection(population, costs, tournament_size)
+            child = order_crossover(p1, p2, demands, capacity, num_vehicles, matrix, earliest, latest)
+            adaptive_rate = mutation_rate * (1.0 + stagnation_counter / 500.0)
+            adaptive_rate = min(adaptive_rate, 0.5)
+            child = mutate(child, demands, capacity, num_vehicles, adaptive_rate, matrix, earliest, latest)
+            new_pop.append(child)
+        population = new_pop
+
+    # final intensive local search
+    for iteration in range(50):
+        start_cost = best_cost
+        if earliest is not None:
+            improved = repair_time_windows(best_solution, matrix, earliest, latest) if 'repair_time_windows' in globals() else best_solution
+            c = route_cost(improved, matrix, earliest, latest, use_numba=use_numba)
+            if c < best_cost:
+                best_solution, best_cost = improved, c
+
+        improved = two_opt(best_solution, matrix)
+        c = route_cost(improved, matrix, earliest, latest, use_numba=use_numba)
+        if c < best_cost:
+            best_solution, best_cost = improved, c
+
+        improved = or_opt(best_solution, matrix, max_iterations=50)
+        c = route_cost(improved, matrix, earliest, latest, use_numba=use_numba)
+        if c < best_cost:
+            best_solution, best_cost = improved, c
+
+        improved = relocate_inter_route(best_solution, demands, capacity, matrix, max_iterations=100)
+        c = route_cost(improved, matrix, earliest, latest, use_numba=use_numba)
+        if c < best_cost:
+            best_solution, best_cost = improved, c
+
+        improved = swap_inter_route(best_solution, demands, capacity, matrix, max_iterations=100)
+        c = route_cost(improved, matrix, earliest, latest, use_numba=use_numba)
+        if c < best_cost:
+            best_solution, best_cost = improved, c
+
+        if best_cost == start_cost and iteration > 20:
+            break
+
+    print(f"FINAL COST: {best_cost:.2f} | Routes: {len([r for r in best_solution if len(r) > 2])}")
+    coords_dict = dict(enumerate(node_coords))
+    try:
+        plot_solution(best_solution, coords_dict, f"Best Solution: {best_cost:.2f}")
+        plot_convergence(history)
+    except Exception:
+        pass
+
+    return {"route": best_solution, "cost": best_cost}
+
+
+# -------------
+# Small helper copied from original for TW repair (kept for compatibility)
+# -------------
+def repair_time_windows(routes, matrix, earliest, latest):
+    """Try to reduce time window violations by reordering customers within routes"""
+    if earliest is None or latest is None:
+        return routes
+    improved_routes = []
+    for route in routes:
+        if len(route) <= 2:
+            improved_routes.append(route)
+            continue
+        customers = route[1:-1]
+        if not customers:
+            improved_routes.append(route)
+            continue
+        best_route = route[:]
+        best_violations = calculate_route_violations(route, matrix, earliest, latest)
+        # sort by earliest
+        customers_by_earliest = sorted(customers, key=lambda c: earliest[c])
+        rvar = [0] + customers_by_earliest + [0]
+        v = calculate_route_violations(rvar, matrix, earliest, latest)
+        if v < best_violations:
+            best_route, best_violations = rvar, v
+        # sort by latest
+        customers_by_latest = sorted(customers, key=lambda c: latest[c])
+        rvar = [0] + customers_by_latest + [0]
+        v = calculate_route_violations(rvar, matrix, earliest, latest)
+        if v < best_violations:
+            best_route, best_violations = rvar, v
+        # nearest neighbor heuristic inside route
+        remaining = set(customers)
+        nn_route = [0]
+        current_time = 0.0
+        current_node = 0
+        while remaining:
+            best_next = None
+            best_score = float('inf')
+            for cust in remaining:
+                travel = matrix[current_node, cust]
+                arrival = current_time + travel
+                tw_penalty = max(0, arrival - latest[cust]) * 10.0
+                score = travel + tw_penalty
+                if score < best_score:
+                    best_score = score
+                    best_next = cust
+            if best_next is None:
+                break
+            nn_route.append(best_next)
+            remaining.remove(best_next)
+            travel = matrix[current_node, best_next]
+            arrival = current_time + travel
+            current_time = max(arrival, earliest[best_next]) + 10.0
+            current_node = best_next
+        nn_route.append(0)
+        v = calculate_route_violations(nn_route, matrix, earliest, latest)
+        if v < best_violations:
+            best_route = nn_route
+        improved_routes.append(best_route)
+    return improved_routes
